@@ -6,7 +6,8 @@ import bcrypt
 import logging
 from datetime import datetime, time
 from dotenv import load_dotenv
-from datetime import datetime, time, date
+from datetime import datetime, time, date,timedelta
+from typing import Tuple, Dict, Any, List, Optional
 # Load environment variables and configure logging
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -57,48 +58,49 @@ class UserManager:
         return self.db_manager.get_collection(self.collection).count_documents({}) == 0
     
     def create_user(self, name, phone, emergency_contact, email, password,
-                   is_existing_user=False, previous_stats=None, previous_rides=None):
-        if not all([name, phone, emergency_contact, email, password]):
-            raise ValueError("All fields are required")
+                is_existing_user=False, previous_stats=None, previous_rides=None):
+      if not all([name, phone, emergency_contact, email, password]):
+          raise ValueError("All fields are required")
 
-        existing_user = self.db_manager.find_document(
-            self.collection,
-            {"$or": [{"phone": phone}, {"email": email}]}
-        )
-        if existing_user:
-            raise ValueError("User with this phone or email already exists")
+      existing_user = self.db_manager.find_document(
+          self.collection,
+          {"$or": [{"phone": phone}, {"email": email}]}
+      )
+      if existing_user:
+          raise ValueError("User with this phone or email already exists")
 
-        hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
-        
-        # Initialize roles - first user gets admin
-        roles = ["rider"]
-        if self.db_manager.get_collection(self.collection).count_documents({}) == 0:
-            roles.extend(["admin", "flag_holder"])
+      hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
+      
+      # Initialize roles - first user gets admin
+      roles = ["rider"]
+      if self._is_first_user():
+          roles.extend(["admin", "flag_holder"])
 
-        total_rides = previous_rides or 0
-        if previous_stats and 'total_rides' in previous_stats:
-            total_rides = previous_stats['total_rides']
+      # Create stats dictionary properly including total_rides
+      stats = previous_stats or {}
+      stats['total_rides'] = previous_rides or 0  # Explicitly set total_rides
 
-        user_data = {
-            "name": name,
-            "phone": phone,
-            "emergency_contact": emergency_contact,
-            "email": email,
-            "password": hashed_password,
-            "roles": roles,
-            "is_existing_user": is_existing_user,
-            "stats": previous_stats or {
-                "sweeps": 0,
-                "leads": 0,
-                "running_pilots": 0,
-                "ride_marshals": 0,
-                "total_rides": total_rides
-            },
-            "created_at": datetime.utcnow()
-        }
+      user_data = {
+          "name": name,
+          "phone": phone,
+          "emergency_contact": emergency_contact,
+          "email": email,
+          "password": hashed_password,
+          "roles": roles,
+          "is_existing_user": is_existing_user,
+          "stats": {
+              "sweeps": stats.get('sweeps', 0),
+              "leads": stats.get('leads', 0),
+              "running_pilots": stats.get('running_pilots', 0),
+              "ride_marshals": stats.get('ride_marshals', 0),
+              "total_rides": stats.get('total_rides', 0)  # Include total_rides in stats
+          },
+          "created_at": datetime.utcnow()
+      }
 
-        result = self.db_manager.insert_document(self.collection, user_data)
-        return result.inserted_id
+      result = self.db_manager.insert_document(self.collection, user_data)
+      return result.inserted_id
+
 
     def authenticate_user(self, phone_or_email, password):
         user = self.db_manager.find_document(
@@ -124,6 +126,36 @@ class UserManager:
             )
             return True
         return False
+    def update_user_status(self, user_id: str, status: str) -> bool:
+        """Update user status (active/blocked)"""
+        try:
+            self.db_manager.update_document(
+                self.collection,
+                {"_id": ObjectId(user_id)},
+                {"status": status}
+            )
+            return True
+        except Exception as e:
+            logging.error(f"Error updating user status: {e}")
+            return False
+
+    def update_user_roles(self, user_id: str, roles: List[str]) -> bool:
+        """Update user roles"""
+        try:
+            self.db_manager.update_document(
+                self.collection,
+                {"_id": ObjectId(user_id)},
+                {"roles": roles}
+            )
+            return True
+        except Exception as e:
+            logging.error(f"Error updating user roles: {e}")
+            return False
+
+    def get_all_users(self) -> List[Dict]:
+        """Get all users with their details"""
+        return list(self.db_manager.get_collection(self.collection).find())
+
 
 class RideManager:
     def __init__(self, db_manager):
@@ -136,52 +168,363 @@ class RideManager:
             "Point D - West Gate"
         ]
 
-    def _format_time(self, time_obj):
+    def _ensure_meeting_points(self):
+        """Initialize meeting points collection if it doesn't exist"""
+        if not self.db_manager.get_collection("meeting_points").find_one({}):
+            default_points = [
+                "Point A - North City",
+                "Point B - South Plaza",
+                "Point C - East Bridge",
+                "Point D - West Gate"
+            ]
+            self.db_manager.get_collection("meeting_points").insert_many(
+                [{"name": point} for point in default_points]
+            )
+
+    def get_meeting_points(self):
+        """Get all meeting points"""
+        return [doc["name"] for doc in self.db_manager.get_collection("meeting_points").find()]
+
+    def add_meeting_point(self, point_name: str) -> bool:
+        """Add a new meeting point"""
+        try:
+            if not self.db_manager.get_collection("meeting_points").find_one({"name": point_name}):
+                self.db_manager.get_collection("meeting_points").insert_one({"name": point_name})
+                return True
+            return False
+        except Exception as e:
+            logging.error(f"Error adding meeting point: {e}")
+            return False
+
+    def remove_meeting_point(self, point_name: str) -> bool:
+        """Remove a meeting point"""
+        try:
+            result = self.db_manager.get_collection("meeting_points").delete_one({"name": point_name})
+            return result.deleted_count > 0
+        except Exception as e:
+            logging.error(f"Error removing meeting point: {e}")
+            return False
+
+    def _format_time(self, time_obj: time) -> str:
         """Convert time object to string format"""
         if isinstance(time_obj, time):
             return time_obj.strftime("%H:%M")
         return time_obj
 
-    def _format_date(self, date_obj):
+    def _format_date(self, date_obj: datetime) -> datetime:
         """Convert date object to datetime format for MongoDB"""
         if isinstance(date_obj, datetime):
             return date_obj
         return datetime.combine(date_obj, time())
 
-    def create_ride(self, name, meeting_point, meeting_time, departure_time,
-                   arrival_time, date, description, creator_id):
+    def get_ride_by_id(self, ride_id: int) -> Optional[Dict]:
+        """Retrieve a ride by its ID"""
+        return self.db_manager.find_document(self.collection, {"ride_id": ride_id})
+
+    def update_ride_status(self, ride_id: int, status: str) -> bool:
+        """Update the status of a ride"""
+        try:
+            self.db_manager.update_document(
+                self.collection,
+                {"ride_id": ride_id},
+                {"status": status}
+            )
+            return True
+        except Exception as e:
+            logging.error(f"Error updating ride status: {e}")
+            return False
+
+    def get_upcoming_rides(self) -> List[Dict]:
+        """Get all upcoming rides"""
+        current_date = datetime.now()
+        return list(self.db_manager.get_collection(self.collection).find({
+            "end_date": {"$gte": current_date}
+        }).sort("start_date", 1))
+
+    def get_past_rides(self) -> List[Dict]:
+        """Get all past rides"""
+        current_date = datetime.now()
+        return list(self.db_manager.get_collection(self.collection).find({
+            "end_date": {"$lt": current_date}
+        }).sort("start_date", -1))
+
+    def create_ride(self, name: str, meeting_point: str, meeting_time: time,
+                   departure_time: time, arrival_time: time, 
+                   start_date: datetime, end_date: datetime, 
+                   description: str, creator_id: str) -> Tuple[str, str]:
+        """
+        Create a new ride with multi-day support
+        Returns: Tuple of (ride_id, whatsapp_message)
+        """
         ride_id = self.db_manager.get_next_ride_id()
         
-        # Format time objects to strings
-        formatted_meeting_time = self._format_time(meeting_time)
-        formatted_departure_time = self._format_time(departure_time)
-        formatted_arrival_time = self._format_time(arrival_time) if arrival_time else None
+        # Get creator details for ride marshal
+        creator = self.db_manager.find_document("users", {"_id": ObjectId(creator_id)})
         
-        # Convert date to datetime for MongoDB compatibility
-        formatted_date = self._format_date(date)
+        # Initialize days list
+        days = []
+        current_date = start_date
+        day_count = (end_date - start_date).days + 1
         
+        for day in range(day_count):
+            days.append({
+                "day": day + 1,
+                "date": current_date + timedelta(days=day),
+                "roles": {
+                    "lead": None,
+                    "sweep": None,
+                    "pilot": None,
+                },
+                "attendance": []
+            })
+
         ride_data = {
             "ride_id": ride_id,
             "name": name,
             "meeting_point": meeting_point,
-            "meeting_time": formatted_meeting_time,
-            "departure_time": formatted_departure_time,
-            "arrival_time": formatted_arrival_time,
-            "date": formatted_date,
+            "meeting_time": self._format_time(meeting_time),
+            "departure_time": self._format_time(departure_time),
+            "arrival_time": self._format_time(arrival_time),
+            "start_date": self._format_date(start_date),
+            "end_date": self._format_date(end_date),
             "description": description,
             "creator_id": creator_id,
+            "ride_marshal": {
+                "id": creator_id,
+                "name": creator.get("name"),
+                "phone": creator.get("phone")
+            },
             "status": "pending",
+            "days": days,
             "participants": [],
-            "attendance": [],
             "created_at": datetime.utcnow()
         }
         
         result = self.db_manager.insert_document(self.collection, ride_data)
-        return result.inserted_id
+        return result.inserted_id, self._generate_whatsapp_message(ride_data)
+
+    def update_ride_day(self, ride_id: int, day_number: int, 
+                       attendance: List[str], roles: Dict[str, str]) -> bool:
+        """Update attendance and roles for a specific day of a ride"""
+        try:
+            ride = self.get_ride_by_id(ride_id)
+            if not ride or day_number > len(ride['days']):
+                return False
+
+            ride['days'][day_number - 1]['attendance'] = attendance
+            ride['days'][day_number - 1]['roles'] = roles
+
+            self.db_manager.update_document(
+                self.collection,
+                {"ride_id": ride_id},
+                {"days": ride['days']}
+            )
+            return True
+        except Exception as e:
+            logging.error(f"Error updating ride day: {e}")
+            return False
+
+    def add_participant(self, ride_id: int, user_id: str) -> bool:
+        """Add a participant to a ride"""
+        try:
+            ride = self.get_ride_by_id(ride_id)
+            if not ride:
+                return False
+
+            participants = ride.get('participants', [])
+            if user_id not in participants:
+                participants.append(user_id)
+                self.db_manager.update_document(
+                    self.collection,
+                    {"ride_id": ride_id},
+                    {"participants": participants}
+                )
+            return True
+        except Exception as e:
+            logging.error(f"Error adding participant: {e}")
+            return False
+
+    def remove_participant(self, ride_id: int, user_id: str) -> bool:
+        """Remove a participant from a ride"""
+        try:
+            ride = self.get_ride_by_id(ride_id)
+            if not ride:
+                return False
+
+            participants = ride.get('participants', [])
+            if user_id in participants:
+                participants.remove(user_id)
+                self.db_manager.update_document(
+                    self.collection,
+                    {"ride_id": ride_id},
+                    {"participants": participants}
+                )
+            return True
+        except Exception as e:
+            logging.error(f"Error removing participant: {e}")
+            return False
+
+    def _generate_whatsapp_message(self, ride_data: Dict[str, Any]) -> str:
+        """Generate WhatsApp message format for ride details"""
+        days_str = "1 day" if ride_data['start_date'] == ride_data['end_date'] else f"{(ride_data['end_date'] - ride_data['start_date']).days + 1} days"
+        
+        # Format dates for display
+        start_date = ride_data['start_date'].strftime('%d-%b-%Y')
+        end_date = ride_data['end_date'].strftime('%d-%b-%Y')
+        
+        message = f"""🏍️ *{ride_data['name']}*
+        
+📅 Date: {start_date}
+{f"➡️ End Date: {end_date}" if start_date != end_date else ""}
+⏰ Meeting Time: {ride_data['meeting_time']}
+🚦 Departure Time: {ride_data['departure_time']}
+📍 Meeting Point: {ride_data['meeting_point']}
+
+📝 Description:
+{ride_data['description']}
+
+👮‍♂️ Ride Marshal: {ride_data['ride_marshal']['name']}
+📱 Contact: {ride_data['ride_marshal']['phone']}
+
+🎫 Ride ID: #{ride_data['ride_id']}
+⏳ Duration: {days_str}
+
+Please confirm your participation by responding in the group.
+Remember to carry your gear and necessary documents.
+
+#BikeLife #RideSafe"""
+        
+        return message
+
+    def get_ride_statistics(self, ride_id: int) -> Dict[str, Any]:
+        """Get comprehensive statistics for a ride"""
+        ride = self.get_ride_by_id(ride_id)
+        if not ride:
+            return {}
+
+        stats = {
+            "total_participants": len(ride.get('participants', [])),
+            "days": [],
+            "total_attendance": 0
+        }
+
+        for day in ride.get('days', []):
+            day_stats = {
+                "day": day['day'],
+                "date": day['date'],
+                "attendance_count": len(day.get('attendance', [])),
+                "roles": day.get('roles', {})
+            }
+            stats["days"].append(day_stats)
+            stats["total_attendance"] += day_stats["attendance_count"]
+
+        if stats["days"]:
+            stats["average_attendance"] = stats["total_attendance"] / len(stats["days"])
+
+        return stats
+
+    def get_user_participation(self, user_id: str) -> Dict[str, Any]:
+        """Get participation statistics for a specific user"""
+        rides = list(self.db_manager.get_collection(self.collection).find({
+            "$or": [
+                {"participants": user_id},
+                {"days.attendance": user_id},
+                {"days.roles.lead": user_id},
+                {"days.roles.sweep": user_id},
+                {"days.roles.pilot": user_id}
+            ]
+        }))
+
+        stats = {
+            "total_rides_participated": 0,
+            "total_days_attended": 0,
+            "roles": {
+                "lead": 0,
+                "sweep": 0,
+                "pilot": 0
+            },
+            "recent_rides": []
+        }
+
+        for ride in rides:
+            stats["total_rides_participated"] += 1
+            
+            for day in ride.get('days', []):
+                if user_id in day.get('attendance', []):
+                    stats["total_days_attended"] += 1
+                
+                roles = day.get('roles', {})
+                if roles.get('lead') == user_id:
+                    stats["roles"]["lead"] += 1
+                if roles.get('sweep') == user_id:
+                    stats["roles"]["sweep"] += 1
+                if roles.get('pilot') == user_id:
+                    stats["roles"]["pilot"] += 1
+
+            # Add to recent rides if within last 30 days
+            if ride['end_date'] >= datetime.utcnow() - timedelta(days=30):
+                stats["recent_rides"].append({
+                    "ride_id": ride['ride_id'],
+                    "name": ride['name'],
+                    "date": ride['start_date']
+                })
+
+        return stats
 class Dashboard:
     def __init__(self, user_manager, ride_manager):
         self.user_manager = user_manager
         self.ride_manager = ride_manager
+
+    def _show_ride_history(self):
+        st.markdown('<h1 class="section-header">Ride History</h1>', unsafe_allow_html=True)
+        
+        past_rides = self.ride_manager.get_past_rides()
+        
+        if not past_rides:
+            st.info("No past rides found.")
+            return
+            
+        for ride in past_rides:
+            st.markdown(f"""
+            <div class="ride-card">
+                <h3>#{ride['ride_id']} - {ride['name']}</h3>
+                <p><strong>Ride Marshal:</strong> {ride['ride_marshal']['name']}</p>
+                <p>📍 {ride['meeting_point']}</p>
+                <p>📅 {ride['start_date'].strftime('%Y-%m-%d')} | 
+                   ⏰ {ride['meeting_time']} - {ride.get('arrival_time', 'N/A')}</p>
+                <p>{ride.get('description', '')}</p>
+            </div>
+            """, unsafe_allow_html=True)
+
+    def _show_meeting_point_management(self):
+        st.markdown('<h1 class="section-header">Meeting Point Management</h1>', unsafe_allow_html=True)
+        
+        # Add new meeting point
+        with st.form("add_meeting_point"):
+            new_point = st.text_input("New Meeting Point")
+            if st.form_submit_button("Add Meeting Point"):
+                if new_point:
+                    if self.ride_manager.add_meeting_point(new_point):
+                        st.success("Meeting point added successfully!")
+                        st.rerun()
+                    else:
+                        st.error("Failed to add meeting point")
+        
+        # List and remove existing points
+        st.subheader("Existing Meeting Points")
+        existing_points = self.ride_manager.get_meeting_points()
+        
+        for point in existing_points:
+            col1, col2 = st.columns([4, 1])
+            with col1:
+                st.write(point)
+            with col2:
+                if st.button("Remove", key=f"remove_{point}"):
+                    if self.ride_manager.remove_meeting_point(point):
+                        st.success("Meeting point removed successfully!")
+                        st.rerun()
+                    else:
+                        st.error("Failed to remove meeting point")
 
     def show_dashboard(self, user):
         # Modern dark theme CSS
@@ -313,11 +656,11 @@ class Dashboard:
         </style>
         """, unsafe_allow_html=True)
 
-        available_pages = ["Dashboard"]
+        available_pages = ["Dashboard", "Ride History"]  # Add Ride History to all roles
         if "flag_holder" in user['roles']:
             available_pages.extend(["Create Ride", "Pre-ride Report"])
         if "admin" in user['roles']:
-            available_pages.extend(["User Management"])
+            available_pages.extend(["User Management", "Meeting Point Management"])  # Add new admin page
         if "admin" in user['roles'] or "flag_holder" in user['roles']:
             available_pages.extend(["Attendance"])
 
@@ -326,7 +669,9 @@ class Dashboard:
             "Create Ride": "🏍️",
             "User Management": "👥",
             "Attendance": "✓",
-            "Pre-ride Report": "📋"
+            "Pre-ride Report": "📋",
+            "Ride History": "📜",
+            "Meeting Point Management": "📍"
         }
 
         selected_page = st.sidebar.radio(
@@ -345,65 +690,70 @@ class Dashboard:
             self._show_attendance_marking()
         elif selected_page == "Pre-ride Report":
             self._show_preride_report()
+        elif selected_page == "Ride History":
+            self._show_ride_history()
+        elif selected_page == "Meeting Point Management":
+            self._show_meeting_point_management()
 
     def _calculate_total_rides(self, user_id):
-        """
-        Calculate and update total rides for the user, including previous rides.
-        """
-        user_id_str = str(user_id)
-        
-        # Calculate attended rides
-        attended_rides = self.ride_manager.db_manager.get_collection("rides").count_documents({
-            "attendance": user_id_str
-        })
-        
-        # Calculate participated rides
-        participated_rides = self.ride_manager.db_manager.get_collection("rides").count_documents({
-            "participants": user_id_str
-        })
-        
-        # Fetch user data
-        user = self.user_manager.db_manager.find_document("users", {"_id": user_id})
-        
-        # Check if user exists
-        if not user:
-            raise ValueError(f"User with ID {user_id} not found.")
-        
-        # Debug: Print fetched user data
-        print(f"Fetched user data: {user}")
-        
-        # Get previous rides or default to 0
-        previous_rides = user.get('previous_rides', 0)
-        print(f"Fetched previous rides: {previous_rides}")  # Debug log
-        
-        # Calculate total rides
-        total_rides = attended_rides + participated_rides + previous_rides
-        
-        # Update the rides field dynamically
-        self.user_manager.db_manager.update_document(
-            "users",
-            {"_id": user_id},
-            {"$set": {"rides": total_rides}}
-        )
-        
-        # Debug: Print updated ride count
-        print(f"Updated total rides: {total_rides}")
-        
-        return total_rides
+      """
+      Calculate total rides by:
+      1. For non-existing users: Only count current system participation
+      2. For existing users: Add previous system rides to current participation
+      """
+      # Get user details
+      user = self.user_manager.db_manager.find_document("users", {"_id": user_id})
+      
+      # Get current system participation
+      participation_stats = self.ride_manager.get_user_participation(str(user_id))
+      current_rides = participation_stats.get('total_days_attended', 0)
+      
+      # If user is from previous system, add their previous rides
+      if user.get('is_existing_user', False):
+          previous_rides = user.get('stats', {}).get('total_rides', 0)
+          total_rides = previous_rides + current_rides
+      else:
+          # For new users, only count current system rides
+          total_rides = current_rides
+      
+      return total_rides
 
     def _show_rider_stats(self, user):
-        """Updated method to show rider statistics"""
-        # Calculate total rides including all sources
+        """Show rider statistics including previous and current rides"""
         total_rides = self._calculate_total_rides(user['_id'])
+        
+        # Get current participation stats
+        participation = self.ride_manager.get_user_participation(str(user['_id']))
+        
+        # Get previous stats
         stats = user.get('stats', {})
+        
+        # For existing users, only add current participation to previous stats
+        # For new users, just show current participation
+        if user.get('is_existing_user', False):
+            combined_stats = {
+                'total_rides': total_rides,  # This now correctly includes both previous and current rides
+                'leads': stats.get('leads', 0) + participation['roles']['lead'],
+                'sweeps': stats.get('sweeps', 0) + participation['roles']['sweep'],
+                'running_pilots': stats.get('running_pilots', 0) + participation['roles']['pilot'],
+                'ride_marshals': stats.get('ride_marshals', 0)
+            }
+        else:
+            combined_stats = {
+                'total_rides': participation['total_days_attended'],
+                'leads': participation['roles']['lead'],
+                'sweeps': participation['roles']['sweep'],
+                'running_pilots': participation['roles']['pilot'],
+                'ride_marshals': 0
+            }
         
         col1, col2, col3, col4, col5 = st.columns(5)
         stats_data = [
-            ("🛣️ Total Rides", total_rides),
-            ("🚦 Lead", stats.get('leads', 0)),
-            ("🔧 Sweep", stats.get('sweeps', 0)),
-            ("🏃 Running Pilot", stats.get('running_pilots', 0)),
-            ("👮 Marshal", stats.get('ride_marshals', 0))
+            ("🛣️ Total Rides", combined_stats['total_rides']),
+            ("🚦 Lead", combined_stats['leads']),
+            ("🔧 Sweep", combined_stats['sweeps']),
+            ("🏃 Running Pilot", combined_stats['running_pilots']),
+            ("👮 Marshal", combined_stats['ride_marshals'])
         ]
         
         for col, (label, value) in zip([col1, col2, col3, col4, col5], stats_data):
@@ -415,14 +765,12 @@ class Dashboard:
                 </div>
                 """, unsafe_allow_html=True)
 
-
     def _show_main_dashboard(self, user):
         st.markdown('<h1 class="section-header">🏍️ Dashboard</h1>', unsafe_allow_html=True)
         self._show_rider_stats(user)
         st.markdown('<h2 class="section-header">Available Rides</h2>', unsafe_allow_html=True)
         self._show_available_rides(user)
 
-    
     def _show_ride_creation(self, user):
         st.markdown('<h1 class="section-header">Create New Ride</h1>', unsafe_allow_html=True)
         
@@ -431,261 +779,235 @@ class Dashboard:
             with col1:
                 name = st.text_input("Ride Name")
                 meeting_point = st.selectbox("Meeting Point", self.ride_manager.MEETING_POINTS)
-                date = st.date_input("Date")
+                start_date = st.date_input("Start Date")
+                end_date = st.date_input("End Date")
             
             with col2:
                 meeting_time = st.time_input("Meeting Time")
                 departure_time = st.time_input("Departure Time")
-            
+                arrival_time = st.time_input("Expected Arrival Time")
+
             description = st.text_area("Description")
             
             if st.form_submit_button("Create Ride"):
-                if not all([name, meeting_point, date, description]):
+                if not all([name, meeting_point, start_date, end_date, description]):
                     st.error("All fields are required!")
                 else:
                     try:
-                        self.ride_manager.create_ride(
+                        ride_id, whatsapp_msg = self.ride_manager.create_ride(
                             name=name,
                             meeting_point=meeting_point,
                             meeting_time=meeting_time,
                             departure_time=departure_time,
-                            arrival_time=None,
-                            date=date,
+                            arrival_time=arrival_time,
+                            start_date=datetime.combine(start_date, time()),
+                            end_date=datetime.combine(end_date, time()),
                             description=description,
-                            creator_id=user['_id']
+                            creator_id=str(user['_id'])
                         )
                         st.success("Ride created successfully!")
+                        
+                        # Show WhatsApp message in expandable section
+                        with st.expander("WhatsApp Message Format"):
+                            st.code(whatsapp_msg, language=None)
+                            
                     except Exception as e:
                         st.error(f"Failed to create ride: {str(e)}")
 
     def _show_available_rides(self, user):
-        # Get all rides sorted by date
-        rides = list(self.ride_manager.db_manager.get_collection("rides").find())
-        rides.sort(key=lambda x: x['date'], reverse=True)
+        # Get upcoming rides using RideManager
+        upcoming_rides = self.ride_manager.get_upcoming_rides()
         
-        for ride in rides:
+        for ride in upcoming_rides:
+            # Format dates for display
+            start_date = ride['start_date'].strftime('%Y-%m-%d')
+            end_date = ride['end_date'].strftime('%Y-%m-%d')
+            date_display = start_date if start_date == end_date else f"{start_date} to {end_date}"
+            
             st.markdown(f"""
             <div class="ride-card">
                 <h3>#{ride['ride_id']} - {ride['name']}</h3>
                 <p>📍 {ride['meeting_point']}</p>
-                <p>📅 {ride['date'].strftime('%Y-%m-%d')} | ⏰ {ride['meeting_time']}</p>
+                <p>📅 {date_display} | ⏰ {ride['meeting_time']}</p>
                 <p>{ride.get('description', '')}</p>
             </div>
             """, unsafe_allow_html=True)
             
             col1, col2 = st.columns([1, 4])
             with col1:
-                if str(user['_id']) in [str(p) for p in ride.get('participants', [])]:
+                str_user_id = str(user['_id'])
+                if str_user_id in [str(p) for p in ride.get('participants', [])]:
                     if st.button("Leave", key=f"leave_{ride['ride_id']}"):
-                        participants = [p for p in ride.get('participants', []) 
-                                     if str(p) != str(user['_id'])]
-                        self.ride_manager.db_manager.update_document(
-                            "rides",
-                            {"ride_id": ride['ride_id']},
-                            {"participants": participants}
-                        )
-                        st.rerun()
+                        if self.ride_manager.remove_participant(ride['ride_id'], str_user_id):
+                            st.rerun()
                 else:
                     if st.button("Join", key=f"join_{ride['ride_id']}"):
-                        participants = ride.get('participants', [])
-                        participants.append(user['_id'])
-                        self.ride_manager.db_manager.update_document(
-                            "rides",
-                            {"ride_id": ride['ride_id']},
-                            {"participants": participants}
-                        )
-                        st.rerun()
+                        if self.ride_manager.add_participant(ride['ride_id'], str_user_id):
+                            st.rerun()
+
     def _show_attendance_marking(self):
         st.markdown('<h1 class="section-header">Mark Attendance</h1>', unsafe_allow_html=True)
         
         # Get rides sorted by date
-        rides = list(self.ride_manager.db_manager.get_collection("rides").find())
-        rides.sort(key=lambda x: x['date'], reverse=True)
+        rides = self.ride_manager.get_upcoming_rides()
+        past_rides = self.ride_manager.get_past_rides()
+        all_rides = rides + past_rides
         
-        for ride in rides:
-            with st.expander(f"#{ride['ride_id']} - {ride['name']} ({ride['date'].strftime('%Y-%m-%d')})"):
+        for ride in all_rides:
+            ride_dates = f"{ride['start_date'].strftime('%Y-%m-%d')} to {ride['end_date'].strftime('%Y-%m-%d')}"
+            with st.expander(f"#{ride['ride_id']} - {ride['name']} ({ride_dates})"):
                 users = list(self.user_manager.db_manager.get_collection("users").find())
-                current_attendance = ride.get('attendance', [])
-                current_roles = ride.get('roles', {})
                 
-                # Convert all IDs to strings for consistent comparison
-                current_attendance = [str(id) for id in current_attendance]
-                
-                selected_users = st.multiselect(
-                    "Select present riders",
-                    options=[str(user['_id']) for user in users],
-                    default=current_attendance,
-                    format_func=lambda x: next(
-                        (user['name'] for user in users if str(user['_id']) == x),
-                        str(x)
-                    ),
-                    key=f"attendance_{ride['ride_id']}"
-                )
-              
-                st.subheader("Assign Roles")
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    lead = st.selectbox(
-                        "Lead Rider",
+                # Show attendance for each day
+                for day in ride['days']:
+                    st.subheader(f"Day {day['day']} - {day['date'].strftime('%Y-%m-%d')}")
+                    
+                    # Current attendance and roles
+                    current_attendance = day.get('attendance', [])
+                    current_roles = day.get('roles', {})
+                    
+                    # Convert all IDs to strings for consistent comparison
+                    current_attendance = [str(id) for id in current_attendance]
+                    
+                    selected_users = st.multiselect(
+                        f"Select present riders for Day {day['day']}",
                         options=[str(user['_id']) for user in users],
-                        index=[str(user['_id']) for user in users].index(current_roles.get('lead', str(users[0]['_id']))) if current_roles.get('lead') else 0,
+                        default=current_attendance,
                         format_func=lambda x: next(
                             (user['name'] for user in users if str(user['_id']) == x),
                             str(x)
                         ),
-                        key=f"lead_{ride['ride_id']}"
+                        key=f"attendance_{ride['ride_id']}_{day['day']}"
                     )
                     
-                    sweep = st.selectbox(
-                        "Sweep Rider",
-                        options=[str(user['_id']) for user in users],
-                        index=[str(user['_id']) for user in users].index(current_roles.get('sweep', str(users[0]['_id']))) if current_roles.get('sweep') else 0,
-                        format_func=lambda x: next(
-                            (user['name'] for user in users if str(user['_id']) == x),
-                            str(x)
-                        ),
-                        key=f"sweep_{ride['ride_id']}"
-                    )
-                
-                with col2:
-                    marshal = st.selectbox(
-                        "Ride Marshal",
-                        options=[str(user['_id']) for user in users],
-                        index=[str(user['_id']) for user in users].index(current_roles.get('marshal', str(users[0]['_id']))) if current_roles.get('marshal') else 0,
-                        format_func=lambda x: next(
-                            (user['name'] for user in users if str(user['_id']) == x),
-                            str(x)
-                        ),
-                        key=f"marshal_{ride['ride_id']}"
-                    )
-                    
-                    pilot = st.selectbox(
-                        "Running Pilot",
-                        options=[str(user['_id']) for user in users],
-                        index=[str(user['_id']) for user in users].index(current_roles.get('pilot', str(users[0]['_id']))) if current_roles.get('pilot') else 0,
-                        format_func=lambda x: next(
-                            (user['name'] for user in users if str(user['_id']) == x),
-                            str(x)
-                        ),
-                        key=f"pilot_{ride['ride_id']}"
-                    )
-
-                if st.button("Update", key=f"update_attendance_{ride['ride_id']}"):
-                    try:
-                        # Get previous roles to track changes
-                        previous_roles = ride.get('roles', {})
-                        new_roles = {
-                            'lead': lead,
-                            'sweep': sweep,
-                            'marshal': marshal,
-                            'pilot': pilot
-                        }
-
-                        # Update ride attendance and roles
-                        self.ride_manager.db_manager.update_document(
-                            "rides",
-                            {"ride_id": ride['ride_id']},
-                            {
-                                "attendance": selected_users,
-                                "roles": new_roles
-                            }
+                    # Roles selection
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        lead = st.selectbox(
+                            "Lead Rider",
+                            options=[str(user['_id']) for user in users],
+                            format_func=lambda x: next(
+                                (user['name'] for user in users if str(user['_id']) == x),
+                                str(x)
+                            ),
+                            key=f"lead_{ride['ride_id']}_{day['day']}"
                         )
-
-                        # Update user stats based on role changes
-                        for role_type, user_id in new_roles.items():
-                            # Skip if role hasn't changed
-                            if previous_roles.get(role_type) == user_id:
-                                continue
-
-                            # Get user's current stats including previous system stats
-                            user = self.user_manager.db_manager.find_document(
-                                "users", {"_id": ObjectId(user_id)})
-                            stats = user.get('stats', {})
-                            
-                            role_stat_map = {
-                                'lead': 'leads',
-                                'sweep': 'sweeps',
-                                'marshal': 'ride_marshals',
-                                'pilot': 'running_pilots'
-                            }
-                            
-                            stat_key = role_stat_map[role_type]
-                            current_count = stats.get(stat_key, 0)
-                            
-                            # Update stats
-                            stats[stat_key] = current_count + 1
-                            
-                            # Update total rides if not already counted
-                            if str(user_id) not in ride.get('attendance', []) and user_id in selected_users:
-                                stats['total_rides'] = self._calculate_total_rides(ObjectId(user_id))
-
-                            # Update user stats in database
-                            self.user_manager.db_manager.update_document(
-                                "users",
-                                {"_id": ObjectId(user_id)},
-                                {"stats": stats}
-                            )
-
-                        # Handle users who were previously in roles but aren't anymore
-                        for role_type, prev_user_id in previous_roles.items():
-                            if prev_user_id not in new_roles.values():
-                                prev_user = self.user_manager.db_manager.find_document(
-                                    "users", {"_id": ObjectId(prev_user_id)})
-                                prev_stats = prev_user.get('stats', {})
-                                
-                                stat_key = role_stat_map[role_type]
-                                current_count = prev_stats.get(stat_key, 0)
-                                prev_stats[stat_key] = max(0, current_count - 1)
-                                
-                                self.user_manager.db_manager.update_document(
-                                    "users",
-                                    {"_id": ObjectId(prev_user_id)},
-                                    {"stats": prev_stats}
-                                )
-
-                        # Handle removed attendees
-                        removed_users = set(current_attendance) - set(selected_users)
-                        for user_id in removed_users:
-                            user = self.user_manager.db_manager.find_document(
-                                "users", {"_id": ObjectId(user_id)})
-                            stats = user.get('stats', {})
-                            
-                            # Update total rides count
-                            total_rides = self._calculate_total_rides(ObjectId(user_id))
-                            stats['total_rides'] = total_rides
-                            
-                            self.user_manager.db_manager.update_document(
-                                "users",
-                                {"_id": ObjectId(user_id)},
-                                {"stats": stats}
-                            )
-
-                        st.success("Attendance and roles updated successfully!")
-                    except Exception as e:
-                        st.error(f"Failed to update attendance and roles: {str(e)}")
-                        import traceback
-                        st.error(f"Error details: {traceback.format_exc()}")
+                        
+                        sweep = st.selectbox(
+                            "Sweep Rider",
+                            options=[str(user['_id']) for user in users],
+                            format_func=lambda x: next(
+                                (user['name'] for user in users if str(user['_id']) == x),
+                                str(x)
+                            ),
+                            key=f"sweep_{ride['ride_id']}_{day['day']}"
+                        )
+                    
+                    with col2:
+                        pilot = st.selectbox(
+                            "Running Pilot",
+                            options=[str(user['_id']) for user in users],
+                            format_func=lambda x: next(
+                                (user['name'] for user in users if str(user['_id']) == x),
+                                str(x)
+                            ),
+                            key=f"pilot_{ride['ride_id']}_{day['day']}"
+                        )
+                    
+                    if st.button(f"Update Day {day['day']}", key=f"update_day_{ride['ride_id']}_{day['day']}"):
+                        roles = {
+                            "lead": lead,
+                            "sweep": sweep,
+                            "pilot": pilot
+                        }
+                        if self.ride_manager.update_ride_day(ride['ride_id'], day['day'], selected_users, roles):
+                            st.success(f"Day {day['day']} updated successfully!")
+                            st.rerun()
+                        else:
+                            st.error("Failed to update attendance and roles")
 
     def _show_user_management(self):
       st.markdown('<h1 class="section-header">User Management</h1>', unsafe_allow_html=True)
-      st.info("Building this feature")
-      pass
-    def _get_eligibility_status(self, stats):
-        """Determine rider eligibility for different roles based on stats"""
-        total_rides = stats.get('total_rides', 0)
-        sweeps = stats.get('sweeps', 0)
-        leads = stats.get('leads', 0)
-        
-        eligibility = {
-            'sweep_eligible': total_rides >= 10,
-            'lead_eligible': sweeps >= 3,
-            'rp_eligible': sweeps >= 3 and leads >= 3
-        }
-        return eligibility
+      
+      users = self.user_manager.get_all_users()
+      
+      # Filter controls
+      col1, col2 = st.columns(2)
+      with col1:
+          status_filter = st.selectbox(
+              "Filter by Status",
+              ["All", "Active", "Blocked"],
+              key="status_filter"
+          )
+      with col2:
+          role_filter = st.selectbox(
+              "Filter by Role",
+              ["All", "Admin", "Flag Holder", "Rider"],
+              key="role_filter"
+          )
+      
+      for user in users:
+          # Apply filters
+          if status_filter != "All" and user.get('status', 'Active') != status_filter:
+              continue
+          if role_filter != "All" and role_filter.lower().replace(" ", "_") not in user.get('roles', []):
+              continue
 
+          with st.expander(f"{user['name']} ({user['email']})"):
+              col1, col2 = st.columns(2)
+              
+              with col1:
+                  st.write(f"📱 Phone: {user['phone']}")
+                  st.write(f"🚨 Emergency Contact: {user['emergency_contact']}")
+                  st.write(f"🎭 Roles: {', '.join(user['roles'])}")
+                  st.write(f"📅 Joined: {user['created_at'].strftime('%Y-%m-%d')}")
+              
+              with col2:
+                  # Role management buttons
+                  if "admin" not in user['roles']:
+                      if st.button("Make Admin", key=f"admin_{user['_id']}"):
+                          roles = user.get('roles', []) + ['admin']
+                          if self.user_manager.update_user_roles(str(user['_id']), roles):
+                              st.success("User promoted to Admin")
+                              st.rerun()
+
+                  if "flag_holder" not in user['roles']:
+                      if st.button("Make Flag Holder", key=f"fh_{user['_id']}"):
+                          roles = user.get('roles', []) + ['flag_holder']
+                          if self.user_manager.update_user_roles(str(user['_id']), roles):
+                              st.success("User promoted to Flag Holder")
+                              st.rerun()
+
+                  # Status toggle
+                  current_status = user.get('status', 'Active')
+                  if st.button(
+                      "Block User" if current_status == 'Active' else "Unblock User",
+                      key=f"status_{user['_id']}"
+                  ):
+                      new_status = 'Blocked' if current_status == 'Active' else 'Active'
+                      if self.user_manager.update_user_status(str(user['_id']), new_status):
+                          st.success(f"User {new_status.lower()}")
+                          st.rerun()
+    def _get_eligibility_status(self, user_id):
+        """Determine rider eligibility based on combined previous and current stats"""
+        user = self.user_manager.db_manager.find_document("users", {"_id": user_id})
+        stats = user.get('stats', {})
+        
+        # Get current participation
+        participation = self.ride_manager.get_user_participation(str(user_id))
+        
+        # Combine previous and current stats
+        total_rides = self._calculate_total_rides(user_id)
+        total_sweeps = stats.get('sweeps', 0) + participation['roles']['sweep']
+        total_leads = stats.get('leads', 0) + participation['roles']['lead']
+        
+        return {
+            'sweep_eligible': total_rides >= 10,
+            'lead_eligible': total_sweeps >= 3,
+            'rp_eligible': total_sweeps >= 3 and total_leads >= 3
+        }
     def _show_preride_report(self):
-        """Display pre-ride report with user eligibility"""
+        """Display pre-ride report with user eligibility based on combined stats"""
         st.markdown('<h1 class="section-header">Pre-ride Report</h1>', unsafe_allow_html=True)
         
         # Display eligibility rules
@@ -704,12 +1026,18 @@ class Dashboard:
         # Get all users
         users = list(self.user_manager.db_manager.get_collection("users").find())
         
-        # Display user cards with eligibility
-        st.markdown("### Rider Eligibility Status")
-        
         for user in users:
             stats = user.get('stats', {})
-            eligibility = self._get_eligibility_status(stats)
+            participation = self.ride_manager.get_user_participation(str(user['_id']))
+            eligibility = self._get_eligibility_status(user['_id'])
+            
+            # Calculate combined stats
+            combined_stats = {
+                'total_rides': self._calculate_total_rides(user['_id']),
+                'sweeps': stats.get('sweeps', 0) + participation['roles']['sweep'],
+                'leads': stats.get('leads', 0) + participation['roles']['lead'],
+                'running_pilots': stats.get('running_pilots', 0) + participation['roles']['pilot']
+            }
             
             # Determine card color based on highest eligible role
             card_color = "var(--bg-secondary)"  # default color
@@ -720,32 +1048,34 @@ class Dashboard:
             elif eligibility['sweep_eligible']:
                 card_color = "rgba(34, 197, 94, 0.2)"  # green tint
 
-            # Create user card
             st.markdown(f"""
             <div style='
                 background-color: {card_color};
                 padding: 20px;
                 border-radius: 10px;
-                margin: 10px 0;
-                border: 1px solid rgba(124, 58, 237, 0.2);
+                margin-bottom: 10px;
             '>
                 <h3>{user['name']}</h3>
-                <p>📧 {user['email']} | 📱 {user['phone']}</p>
-                <div style='margin-top: 10px;'>
-                    <strong>Stats:</strong><br>
-                    Total Rides: {stats.get('total_rides', 0)} | 
-                    Sweeps: {stats.get('sweeps', 0)} | 
-                    Leads: {stats.get('leads', 0)} | 
-                    Running Pilots: {stats.get('running_pilots', 0)}
+                <div style='display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px;'>
+                    <div>
+                        <p><strong>Total Rides:</strong> {combined_stats['total_rides']}</p>
+                        <p><strong>Total Sweeps:</strong> {combined_stats['sweeps']}</p>
+                    </div>
+                    <div>
+                        <p><strong>Total Leads:</strong> {combined_stats['leads']}</p>
+                        <p><strong>Running Pilot Days:</strong> {combined_stats['running_pilots']}</p>
+                    </div>
                 </div>
                 <div style='margin-top: 10px;'>
-                    {f'🟢 Sweep Eligible' if eligibility['sweep_eligible'] else ''}
-                    {f' | 🔵 Lead Eligible' if eligibility['lead_eligible'] else ''}
-                    {f' | 🟡 RP Eligible' if eligibility['rp_eligible'] else ''}
+                    <p><strong>Eligible for:</strong></p>
+                    <p>
+                        {' 🟢 Sweep ' if eligibility['sweep_eligible'] else '❌ Sweep '}
+                        {' 🔵 Lead ' if eligibility['lead_eligible'] else '❌ Lead '}
+                        {' 🟡 Running Pilot ' if eligibility['rp_eligible'] else '❌ Running Pilot '}
+                    </p>
                 </div>
             </div>
             """, unsafe_allow_html=True)
-
             # Add emergency contact in expandable section
             with st.expander("View Emergency Contact"):
                 st.write(f"📞 Emergency Contact: {user['emergency_contact']}")    
