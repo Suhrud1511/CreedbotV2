@@ -8,75 +8,129 @@ from datetime import datetime, time
 from dotenv import load_dotenv
 from datetime import datetime, time, date,timedelta
 from typing import Tuple, Dict, Any, List, Optional
+from pymongo.mongo_client import MongoClient
+from pymongo.errors import (
+    ServerSelectionTimeoutError,
+    ConnectionFailure,
+    OperationFailure
+)
+
 # Load environment variables and configure logging
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class DatabaseManager:
-    def __init__(self, uri, db_name):
+    def __init__(self, uri: str, db_name: str, max_retries: int = 3, retry_delay: int = 2):
+        """
+        Initialize database connection with retry mechanism
+        
+        Args:
+            uri: MongoDB connection URI
+            db_name: Name of the database
+            max_retries: Maximum number of connection attempts
+            retry_delay: Delay between retries in seconds
+        """
+        self.uri = uri
+        self.db_name = db_name
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
+        self.client: Optional[MongoClient] = None
+        self.db = None
+        
+        # Configure logging
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+        self.logger = logging.getLogger(__name__)
+        
+        # Initialize connection
+        self._connect_with_retry()
+
+    def _connect_with_retry(self) -> None:
+        """Establish database connection with retry mechanism"""
+        for attempt in range(self.max_retries):
+            try:
+                # Configure MongoDB client with appropriate timeouts and settings
+                self.client = pymongo.MongoClient(
+                    self.uri,
+                    serverSelectionTimeoutMS=5000,
+                    connectTimeoutMS=5000,
+                    socketTimeoutMS=5000,
+                    maxPoolSize=50,
+                    retryWrites=True,
+                    retryReads=True
+                )
+                
+                # Test connection
+                self.client.admin.command('ping')
+                self.db = self.client[self.db_name]
+                
+                self.logger.info(f"Successfully connected to MongoDB database: {self.db_name}")
+                self._ensure_indexes()
+                return
+                
+            except ServerSelectionTimeoutError:
+                self.logger.error(f"Server selection timeout - Attempt {attempt + 1}/{self.max_retries}")
+                if attempt == self.max_retries - 1:
+                    raise ConnectionError(
+                        "Failed to connect to MongoDB. Please verify:\n"
+                        "1. MongoDB server is running\n"
+                        "2. Connection URI is correct\n"
+                        "3. Network connectivity is available\n"
+                        "4. Firewall settings allow connection"
+                    )
+                time.sleep(self.retry_delay)
+                
+            except ConnectionFailure as e:
+                self.logger.error(f"Connection failure: {str(e)}")
+                raise ConnectionError(f"Failed to connect to MongoDB: {str(e)}")
+                
+            except Exception as e:
+                self.logger.error(f"Unexpected error during connection: {str(e)}")
+                raise
+
+    def _ensure_indexes(self) -> None:
+        """Create necessary indexes for collections"""
         try:
-            # Add connection timeout and retry configuration
-            self.client = pymongo.MongoClient(
-                uri,
-                serverSelectionTimeoutMS=5000,  # 5 second timeout
-                connectTimeoutMS=5000,
-                socketTimeoutMS=5000,
-                retryWrites=True,
-                retryReads=True
-            )
-            # Test the connection immediately
-            self.client.admin.command('ping')
+            # Users collection indexes
+            self.db.users.create_index([("email", 1)], unique=True)
+            self.db.users.create_index([("phone", 1)], unique=True)
             
-            self.db = self.client[db_name]
-            self._ensure_ride_counter()
-            logging.info("Connected to MongoDB")
-        except pymongo.errors.ServerSelectionTimeoutError as e:
-            logging.error(f"MongoDB server selection timeout: {e}")
-            st.error("""
-                Unable to connect to MongoDB. Please check:
-                1. MongoDB server is running
-                2. Connection URI is correct
-                3. Network connectivity to MongoDB server
-                4. Firewall settings
-            """)
-            raise
-        except Exception as e:
-            logging.error(f"Failed to connect to MongoDB: {e}")
-            st.error("Failed to connect to database. Please check configuration.")
+            # Rides collection indexes
+            self.db.rides.create_index([("ride_id", 1)], unique=True)
+            self.db.rides.create_index([("start_date", 1)])
+            self.db.rides.create_index([("status", 1)])
+            
+            self.logger.info("Database indexes created successfully")
+        except OperationFailure as e:
+            self.logger.error(f"Failed to create indexes: {str(e)}")
             raise
 
-    def _ensure_ride_counter(self):
+    def get_collection(self, name: str):
+        """Get a database collection"""
+        if not self.db:
+            raise ConnectionError("Database connection not established")
+        return self.db[name]
+
+    def ping(self) -> bool:
+        """Test database connection"""
         try:
-            # Add retry logic for the counter initialization
-            max_retries = 3
-            retry_count = 0
-            
-            while retry_count < max_retries:
-                try:
-                    if not self.db.counters.find_one({"_id": "ride_id"}):
-                        self.db.counters.insert_one({"_id": "ride_id", "seq": 200})
-                    break
-                except pymongo.errors.ServerSelectionTimeoutError:
-                    retry_count += 1
-                    if retry_count == max_retries:
-                        raise
-                    time.sleep(1)  # Wait 1 second before retrying
-                    
+            self.client.admin.command('ping')
+            return True
         except Exception as e:
-            logging.error(f"Failed to initialize ride counter: {e}")
-            raise
+            self.logger.error(f"Failed to ping database: {str(e)}")
+            return False
+
+    def close(self) -> None:
+        """Close database connection"""
+        if self.client:
+            self.client.close()
+            self.logger.info("Database connection closed")
 
     def __del__(self):
-        """Ensure proper cleanup of MongoDB connection"""
-        try:
-            if hasattr(self, 'client'):
-                self.client.close()
-                logging.info("Closed MongoDB connection")
-        except Exception as e:
-            logging.error(f"Error closing MongoDB connection: {e}")
-
-    def get_collection(self, name):
-        return self.db[name]
+        """Cleanup on object destruction"""
+        self.close()
 
     def insert_document(self, collection_name, document):
         return self.get_collection(collection_name).insert_one(document)
