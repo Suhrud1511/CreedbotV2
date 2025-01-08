@@ -15,17 +15,65 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 class DatabaseManager:
     def __init__(self, uri, db_name):
         try:
-            self.client = pymongo.MongoClient(uri)
+            # Add connection timeout and retry configuration
+            self.client = pymongo.MongoClient(
+                uri,
+                serverSelectionTimeoutMS=5000,  # 5 second timeout
+                connectTimeoutMS=5000,
+                socketTimeoutMS=5000,
+                retryWrites=True,
+                retryReads=True
+            )
+            # Test the connection immediately
+            self.client.admin.command('ping')
+            
             self.db = self.client[db_name]
             self._ensure_ride_counter()
             logging.info("Connected to MongoDB")
+        except pymongo.errors.ServerSelectionTimeoutError as e:
+            logging.error(f"MongoDB server selection timeout: {e}")
+            st.error("""
+                Unable to connect to MongoDB. Please check:
+                1. MongoDB server is running
+                2. Connection URI is correct
+                3. Network connectivity to MongoDB server
+                4. Firewall settings
+            """)
+            raise
         except Exception as e:
             logging.error(f"Failed to connect to MongoDB: {e}")
+            st.error("Failed to connect to database. Please check configuration.")
             raise
 
     def _ensure_ride_counter(self):
-        if not self.db.counters.find_one({"_id": "ride_id"}):
-            self.db.counters.insert_one({"_id": "ride_id", "seq": 200})
+        try:
+            # Add retry logic for the counter initialization
+            max_retries = 3
+            retry_count = 0
+            
+            while retry_count < max_retries:
+                try:
+                    if not self.db.counters.find_one({"_id": "ride_id"}):
+                        self.db.counters.insert_one({"_id": "ride_id", "seq": 200})
+                    break
+                except pymongo.errors.ServerSelectionTimeoutError:
+                    retry_count += 1
+                    if retry_count == max_retries:
+                        raise
+                    time.sleep(1)  # Wait 1 second before retrying
+                    
+        except Exception as e:
+            logging.error(f"Failed to initialize ride counter: {e}")
+            raise
+
+    def __del__(self):
+        """Ensure proper cleanup of MongoDB connection"""
+        try:
+            if hasattr(self, 'client'):
+                self.client.close()
+                logging.info("Closed MongoDB connection")
+        except Exception as e:
+            logging.error(f"Error closing MongoDB connection: {e}")
 
     def get_collection(self, name):
         return self.db[name]
@@ -529,131 +577,256 @@ class Dashboard:
     def show_dashboard(self, user):
         # Modern dark theme CSS
         st.markdown("""
-        <style>
-        :root {
-            --bg-primary: #1a1b1e;
-            --bg-secondary: #2c2e33;
-            --text-primary: #ffffff;
-            --text-secondary: #a0a0a0;
-            --accent: #7c3aed;  /* Purple accent */
-            --accent-hover: #9f67ff;
-            --card-bg: #2c2e33;
-            --success: #10b981;
-            --error: #ef4444;
-        }
-        
-        .stApp {
-            background-color: var(--bg-primary) !important;
-            color: var(--text-primary);
-        }
-        
-        .main-container {
-            max-width: 100%;
-            padding: 20px;
-        }
-        
-        .stat-card {
-            background-color: var(--bg-secondary);
-            border-radius: 12px;
-            padding: 1.5rem;
-            margin: 0.8rem 0;
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.2);
-            transition: transform 0.2s ease;
-            text-align: center;
-            border: 1px solid rgba(124, 58, 237, 0.2);
-        }
-        
-        .stat-card:hover {
-            transform: translateY(-2px);
-            border: 1px solid var(--accent);
-        }
-        
-        .stat-card h3 {
-            color: var(--text-secondary);
-            font-size: 0.9rem;
-            margin-bottom: 0.5rem;
-        }
-        
-        .stat-card h2 {
-            color: var(--text-primary);
-            font-size: 1.8rem;
-            font-weight: bold;
-        }
-        
-        .ride-card {
-            background-color: var(--bg-secondary);
-            border-radius: 12px;
-            padding: 1.5rem;
-            margin: 1rem 0;
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.2);
-            transition: all 0.3s ease;
-            width: 100%;
-            border: 1px solid rgba(124, 58, 237, 0.2);
-        }
-        
-        .ride-card:hover {
-            border: 1px solid var(--accent);
-        }
-        
-        .section-header {
-            color: var(--accent);
-            margin: 20px 0;
-            padding: 10px 0;
-            border-bottom: 2px solid var(--accent);
-            font-size: 1.8rem;
-            font-weight: bold;
-        }
-        
-        /* Style Streamlit elements */
-        .stButton button {
-            background-color: var(--accent) !important;
-            color: white !important;
-            border: none !important;
-            border-radius: 6px !important;
-            padding: 0.5rem 1rem !important;
-            transition: all 0.3s ease !important;
-        }
-        
-        .stButton button:hover {
-            background-color: var(--accent-hover) !important;
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.2) !important;
-        }
-        
-        .stTextInput input, .stSelectbox select {
-            background-color: var(--bg-secondary) !important;
-            color: var(--text-primary) !important;
-            border: 1px solid rgba(124, 58, 237, 0.2) !important;
-        }
-        
-        .stTextInput input:focus, .stSelectbox select:focus {
-            border-color: var(--accent) !important;
-        }
-        
-        div[data-baseweb="select"] {
-            background-color: var(--bg-secondary) !important;
-        }
-        
-        div[data-baseweb="select"] input {
-            color: var(--text-primary) !important;
-        }
-        
-        .stSuccess {
-            background-color: var(--success) !important;
-            color: white !important;
-        }
-        
-        .stError {
-            background-color: var(--error) !important;
-            color: white !important;
-        }
-        
-        @media (max-width: 768px) {
-            .stat-card h3 { font-size: 0.8rem; }
-            .stat-card h2 { font-size: 1.5rem; }
-            .ride-card h3 { font-size: 1.2rem; }
-            .ride-card p { font-size: 0.9rem; }
-        }
-        </style>
+            <style>
+            /* Reset and base styles */
+            :root {
+                --bg-primary: #1a1b1e;
+                --bg-secondary: #2c2e33;
+                --text-primary: #ffffff;
+                --text-secondary: #a0a0a0;
+                --accent: #7c3aed;
+                --accent-light: #9f67ff;
+                --accent-dark: #6d28d9;
+                --success: #10b981;
+                --error: #ef4444;
+                --warning: #f59e0b;
+                --info: #3b82f6;
+                --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.1);
+                --shadow-md: 0 4px 6px rgba(0, 0, 0, 0.1);
+                --shadow-lg: 0 10px 15px rgba(0, 0, 0, 0.1);
+                --transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            }
+
+            /* Global Streamlit modifications */
+            .stApp {
+                background-color: var(--bg-primary);
+                color: var(--text-primary);
+            }
+
+            /* Typography enhancements */
+            h1, h2, h3, h4, h5, h6 {
+                font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+                letter-spacing: -0.025em;
+            }
+
+            .section-header {
+                color: var(--accent);
+                font-size: 2rem;
+                font-weight: 700;
+                margin: 2rem 0 1.5rem;
+                padding-bottom: 0.75rem;
+                border-bottom: 2px solid var(--accent);
+                background: linear-gradient(90deg, var(--accent) 0%, transparent 100%);
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
+            }
+
+            /* Card Components */
+            .stat-card {
+                background: linear-gradient(145deg, var(--bg-secondary), var(--bg-primary));
+                border-radius: 1rem;
+                padding: 1.5rem;
+                margin: 1rem 0;
+                box-shadow: var(--shadow-md);
+                border: 1px solid rgba(124, 58, 237, 0.1);
+                transition: var(--transition);
+                backdrop-filter: blur(10px);
+                position: relative;
+                overflow: hidden;
+            }
+
+            .stat-card::before {
+                content: '';
+                position: absolute;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                background: linear-gradient(45deg, transparent, rgba(124, 58, 237, 0.1));
+                opacity: 0;
+                transition: var(--transition);
+            }
+
+            .stat-card:hover {
+                transform: translateY(-4px);
+                border-color: var(--accent);
+                box-shadow: var(--shadow-lg);
+            }
+
+            .stat-card:hover::before {
+                opacity: 1;
+            }
+
+            .stat-card h3 {
+                color: var(--text-secondary);
+                font-size: 0.875rem;
+                font-weight: 500;
+                margin-bottom: 0.5rem;
+                text-transform: uppercase;
+                letter-spacing: 0.05em;
+            }
+
+            .stat-card h2 {
+                color: var(--text-primary);
+                font-size: 2rem;
+                font-weight: 700;
+                margin: 0;
+                background: linear-gradient(90deg, var(--accent) 0%, var(--accent-light) 100%);
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
+            }
+
+            /* Ride Card Component */
+            .ride-card {
+                background: linear-gradient(145deg, var(--bg-secondary), var(--bg-primary));
+                border-radius: 1rem;
+                padding: 2rem;
+                margin: 1.5rem 0;
+                box-shadow: var(--shadow-md);
+                border: 1px solid rgba(124, 58, 237, 0.1);
+                transition: var(--transition);
+                position: relative;
+                overflow: hidden;
+            }
+
+            .ride-card:hover {
+                transform: translateY(-4px);
+                border-color: var(--accent);
+                box-shadow: var(--shadow-lg);
+            }
+
+            .ride-card h3 {
+                font-size: 1.5rem;
+                font-weight: 700;
+                margin-bottom: 1rem;
+                color: var(--text-primary);
+            }
+
+            .ride-card p {
+                color: var(--text-secondary);
+                margin: 0.5rem 0;
+                line-height: 1.6;
+            }
+
+            /* Form Elements */
+            .stTextInput input, 
+            .stSelectbox select, 
+            .stDateInput input,
+            .stTimeInput input {
+                background-color: var(--bg-secondary) !important;
+                color: var(--text-primary) !important;
+                border: 1px solid rgba(124, 58, 237, 0.2) !important;
+                border-radius: 0.5rem !important;
+                padding: 0.75rem 1rem !important;
+                transition: var(--transition) !important;
+            }
+
+            .stTextInput input:focus, 
+            .stSelectbox select:focus,
+            .stDateInput input:focus,
+            .stTimeInput input:focus {
+                border-color: var(--accent) !important;
+                box-shadow: 0 0 0 2px rgba(124, 58, 237, 0.2) !important;
+                outline: none !important;
+            }
+
+            /* Button Styles */
+            .stButton button {
+                background: linear-gradient(45deg, var(--accent-dark), var(--accent)) !important;
+                color: white !important;
+                border: none !important;
+                border-radius: 0.5rem !important;
+                padding: 0.75rem 1.5rem !important;
+                font-weight: 600 !important;
+                letter-spacing: 0.025em !important;
+                transition: var(--transition) !important;
+                text-transform: uppercase !important;
+                box-shadow: var(--shadow-sm) !important;
+            }
+
+            .stButton button:hover {
+                background: linear-gradient(45deg, var(--accent), var(--accent-light)) !important;
+                transform: translateY(-2px) !important;
+                box-shadow: var(--shadow-md) !important;
+            }
+
+            /* Alert/Message Styles */
+            .stSuccess, .stInfo, .stWarning, .stError {
+                padding: 1rem !important;
+                border-radius: 0.5rem !important;
+                margin: 1rem 0 !important;
+                animation: slideIn 0.3s ease-out;
+            }
+
+            .stSuccess {
+                background-color: rgba(16, 185, 129, 0.1) !important;
+                border: 1px solid var(--success) !important;
+            }
+
+            .stError {
+                background-color: rgba(239, 68, 68, 0.1) !important;
+                border: 1px solid var(--error) !important;
+            }
+
+            /* Sidebar Enhancements */
+            .css-1d391kg {
+                background-color: var(--bg-secondary) !important;
+            }
+
+            /* Animations */
+            @keyframes slideIn {
+                from {
+                    transform: translateY(-10px);
+                    opacity: 0;
+                }
+                to {
+                    transform: translateY(0);
+                    opacity: 1;
+                }
+            }
+
+            /* Responsive Design */
+            @media (max-width: 768px) {
+                .section-header {
+                    font-size: 1.5rem;
+                }
+                
+                .stat-card {
+                    padding: 1rem;
+                }
+                
+                .stat-card h2 {
+                    font-size: 1.5rem;
+                }
+                
+                .ride-card {
+                    padding: 1.5rem;
+                }
+                
+                .ride-card h3 {
+                    font-size: 1.25rem;
+                }
+            }
+
+            /* Custom Scrollbar */
+            ::-webkit-scrollbar {
+                width: 8px;
+                height: 8px;
+            }
+
+            ::-webkit-scrollbar-track {
+                background: var(--bg-primary);
+            }
+
+            ::-webkit-scrollbar-thumb {
+                background: var(--accent);
+                border-radius: 4px;
+            }
+
+            ::-webkit-scrollbar-thumb:hover {
+                background: var(--accent-light);
+            }
+            </style>
         """, unsafe_allow_html=True)
 
         available_pages = ["Dashboard", "Ride History"]  # Add Ride History to all roles
