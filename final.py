@@ -12,15 +12,66 @@ from typing import Tuple, Dict, Any, List, Optional
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+def load_environment():
+    """
+    Load environment variables based on the current environment.
+    Priority order:
+    1. Streamlit secrets
+    2. Environment-specific .env file
+    3. Default .env file
+    """
+    # Setup logging
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+
+    # First try to get environment from Streamlit secrets
+    env = os.getenv('ENVIRONMENT') or st.secrets.get("ENVIRONMENT", "development")
+    logger.info(f"Current environment: {env}")
+
+    # Load environment-specific .env file
+    env_file = f".env.{env}"
+    if os.path.exists(env_file):
+        load_dotenv(env_file)
+        logger.info(f"Loaded environment file: {env_file}")
+    else:
+        # Fallback to default .env
+        load_dotenv()
+        logger.info("Loaded default .env file")
+
+    # Priority order for MongoDB URI:
+    # 1. Streamlit secrets
+    # 2. Environment variables
+    # 3. Default fallback
+    mongo_uri = (
+        st.secrets.get("MONGO_URI") or 
+        os.getenv("MONGO_URI") or 
+        "mongodb://localhost:27017/"
+    )
+
+    return {
+        "MONGO_URI": mongo_uri,
+        "ENVIRONMENT": env,
+        # Add other configuration variables here
+    }
+
 class DatabaseManager:
-    def __init__(self, uri, db_name):
+    def __init__(self):
+        # Load configuration
+        config = load_environment()
+        self.uri = config["MONGO_URI"]
+        
         try:
-            self.client = pymongo.MongoClient(uri)
-            self.db = self.client[db_name]
+            self.client = pymongo.MongoClient(self.uri, 
+                                            serverSelectionTimeoutMS=5000,  # Lower timeout for faster feedback
+                                            connectTimeoutMS=5000)
+            # Test the connection
+            self.client.server_info()
+            self.db = self.client["bikers_club"]
             self._ensure_ride_counter()
-            logging.info("Connected to MongoDB")
+            logging.info(f"Connected to MongoDB in {config['ENVIRONMENT']} environment")
         except Exception as e:
             logging.error(f"Failed to connect to MongoDB: {e}")
+            st.error(f"Database connection error. Please check your connection settings. Environment: {config['ENVIRONMENT']}")
             raise
 
     def _ensure_ride_counter(self):
