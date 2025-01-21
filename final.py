@@ -8,70 +8,22 @@ from datetime import datetime, time
 from dotenv import load_dotenv
 from datetime import datetime, time, date,timedelta
 from typing import Tuple, Dict, Any, List, Optional
+import os
+import urllib.parse
+
 # Load environment variables and configure logging
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def load_environment():
-    """
-    Load environment variables based on the current environment.
-    Priority order:
-    1. Streamlit secrets
-    2. Environment-specific .env file
-    3. Default .env file
-    """
-    # Setup logging
-    logging.basicConfig(level=logging.INFO)
-    logger = logging.getLogger(__name__)
-
-    # First try to get environment from Streamlit secrets
-    env = os.getenv('ENVIRONMENT') or st.secrets.get("ENVIRONMENT", "development")
-    logger.info(f"Current environment: {env}")
-
-    # Load environment-specific .env file
-    env_file = f".env.{env}"
-    if os.path.exists(env_file):
-        load_dotenv(env_file)
-        logger.info(f"Loaded environment file: {env_file}")
-    else:
-        # Fallback to default .env
-        load_dotenv()
-        logger.info("Loaded default .env file")
-
-    # Priority order for MongoDB URI:
-    # 1. Streamlit secrets
-    # 2. Environment variables
-    # 3. Default fallback
-    mongo_uri = (
-        st.secrets.get("MONGO_URI") or 
-        os.getenv("MONGO_URI") or 
-        "mongodb://localhost:27017/"
-    )
-
-    return {
-        "MONGO_URI": mongo_uri,
-        "ENVIRONMENT": env,
-        # Add other configuration variables here
-    }
-
 class DatabaseManager:
-    def __init__(self):
-        # Load configuration
-        config = load_environment()
-        self.uri = config["MONGO_URI"]
-        
+    def __init__(self, uri, db_name):
         try:
-            self.client = pymongo.MongoClient(self.uri, 
-                                            serverSelectionTimeoutMS=5000,  # Lower timeout for faster feedback
-                                            connectTimeoutMS=5000)
-            # Test the connection
-            self.client.server_info()
-            self.db = self.client["bikers_club"]
+            self.client = pymongo.MongoClient(uri)
+            self.db = self.client[db_name]
             self._ensure_ride_counter()
-            logging.info(f"Connected to MongoDB in {config['ENVIRONMENT']} environment")
+            logging.info("Connected to MongoDB")
         except Exception as e:
             logging.error(f"Failed to connect to MongoDB: {e}")
-            st.error(f"Database connection error. Please check your connection settings. Environment: {config['ENVIRONMENT']}")
             raise
 
     def _ensure_ride_counter(self):
@@ -1255,18 +1207,70 @@ class Dashboard:
             # Add emergency contact in expandable section
             with st.expander("View Emergency Contact"):
                 st.write(f"📞 Emergency Contact: {user['emergency_contact']}")    
+
+
+
+def get_mongodb_uri():
+    try:
+        # Check the environment variable for the current mode
+        environment = os.getenv("ENVIRONMENT", "production")
+        
+        # Development environment
+        if environment.lower() == "development":
+            dev_uri = os.getenv("MONGODB_URI")
+            if dev_uri:
+                st.success("Running in development mode")
+                return dev_uri
+
+        # Production environment: Check Streamlit secrets
+        try:
+            uri = st.secrets["MONGODB_URI"]
+            if uri:
+                # Validate and encode username/password if necessary
+                parsed_uri = urllib.parse.urlparse(uri)
+                if parsed_uri.username and parsed_uri.password:
+                    username = urllib.parse.quote_plus(parsed_uri.username)
+                    password = urllib.parse.quote_plus(parsed_uri.password)
+                    # Rebuild the URI with encoded credentials
+                    encoded_uri = f"{parsed_uri.scheme}://{username}:{password}@{parsed_uri.hostname}"
+                    if parsed_uri.port:
+                        encoded_uri += f":{parsed_uri.port}"
+                    if parsed_uri.path:
+                        encoded_uri += f"{parsed_uri.path}"
+                    return encoded_uri
+                
+                if environment.lower() == "production":
+                    st.warning(
+                        "Connected to production database. Switch to development mode by setting ENVIRONMENT=development"
+                    )
+                return uri
+        except KeyError:
+            st.error("No MongoDB URI found in secrets.")
+            st.info(
+                "To use the development database, set ENVIRONMENT=development and provide MONGODB_URI in your environment variables."
+            )
+            raise Exception("MongoDB URI not configured")
+
+    except Exception as e:
+        st.error(f"Failed to get MongoDB URI: {str(e)}")
+        raise e
+
 def main():
     st.set_page_config(page_title="Bikers Club", page_icon="🏍️", layout="wide")
     
-    # Initialize managers
-    db_manager = DatabaseManager(
-        uri=os.getenv("MONGO_URI", "mongodb://localhost:27017/"),
-        db_name="bikers_club"
-    )
-    user_manager = UserManager(db_manager)
-    ride_manager = RideManager(db_manager)
-    dashboard = Dashboard(user_manager, ride_manager)
-
+    try:
+        # Initialize managers with the configured URI
+        mongodb_uri = get_mongodb_uri()
+        db_manager = DatabaseManager(
+            uri=mongodb_uri,
+            db_name="bikers_club"
+        )
+        user_manager = UserManager(db_manager)
+        ride_manager = RideManager(db_manager)
+        dashboard = Dashboard(user_manager, ride_manager)
+    except Exception as e:
+        st.error("Failed to initialize application. Please check your configuration.")
+        raise e
     # Initialize session states
     if 'user' not in st.session_state:
         st.session_state.user = None
