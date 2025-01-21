@@ -1212,49 +1212,59 @@ class Dashboard:
 
 def get_mongodb_uri():
     try:
-        # Check the environment variable for the current mode
+        # First check for development environment
         environment = os.getenv("ENVIRONMENT", "production")
         
-        # Development environment
         if environment.lower() == "development":
             dev_uri = os.getenv("MONGODB_URI")
             if dev_uri:
-                st.success("Running in development mode")
+                st.success("Connected to development database")
                 return dev_uri
-
-        # Production environment: Check Streamlit secrets
+            else:
+                st.error("Development mode active but MONGODB_URI environment variable not found")
+                raise Exception("Development MongoDB URI not configured")
+        
+        # Production environment - check Streamlit secrets
         try:
-            uri = st.secrets["MONGODB_URI"]
-            if uri:
-                # Validate and encode username/password if necessary
-                parsed_uri = urllib.parse.urlparse(uri)
-                if parsed_uri.username and parsed_uri.password:
-                    username = urllib.parse.quote_plus(parsed_uri.username)
-                    password = urllib.parse.quote_plus(parsed_uri.password)
-                    # Rebuild the URI with encoded credentials
-                    encoded_uri = f"{parsed_uri.scheme}://{username}:{password}@{parsed_uri.hostname}"
-                    if parsed_uri.port:
-                        encoded_uri += f":{parsed_uri.port}"
-                    if parsed_uri.path:
-                        encoded_uri += f"{parsed_uri.path}"
-                    return encoded_uri
+            uri = st.secrets.get("MONGODB_URI")
+            if not uri:
+                raise KeyError("MONGODB_URI not found in secrets")
                 
-                if environment.lower() == "production":
-                    st.warning(
-                        "Connected to production database. Switch to development mode by setting ENVIRONMENT=development"
-                    )
-                return uri
-        except KeyError:
-            st.error("No MongoDB URI found in secrets.")
-            st.info(
-                "To use the development database, set ENVIRONMENT=development and provide MONGODB_URI in your environment variables."
-            )
-            raise Exception("MongoDB URI not configured")
-
+            # Validate URI format
+            if not uri.startswith(("mongodb://", "mongodb+srv://")):
+                raise ValueError("Invalid MongoDB URI format")
+                
+            # Handle URI encoding
+            parsed_uri = urllib.parse.urlparse(uri)
+            if parsed_uri.username and parsed_uri.password:
+                username = urllib.parse.quote_plus(parsed_uri.username)
+                password = urllib.parse.quote_plus(parsed_uri.password)
+                # Rebuild URI with encoded credentials
+                encoded_uri = f"{parsed_uri.scheme}://{username}:{password}@{parsed_uri.hostname}"
+                if parsed_uri.port:
+                    encoded_uri += f":{parsed_uri.port}"
+                if parsed_uri.path:
+                    encoded_uri += f"{parsed_uri.path}"
+                if parsed_uri.query:
+                    encoded_uri += f"?{parsed_uri.query}"
+                return encoded_uri
+            
+            return uri
+            
+        except Exception as e:
+            st.error(f"""
+            Failed to access MongoDB URI from Streamlit secrets.
+            Please ensure you have configured the secrets in Streamlit Cloud:
+            1. Go to your app dashboard
+            2. Click on "App settings"
+            3. Navigate to "Secrets"
+            4. Add your MongoDB URI as: MONGODB_URI="your-uri-here"
+            """)
+            raise Exception(f"Failed to access MongoDB URI: {str(e)}")
+            
     except Exception as e:
-        st.error(f"Failed to get MongoDB URI: {str(e)}")
+        st.error(str(e))
         raise e
-
 def main():
     st.set_page_config(page_title="Bikers Club", page_icon="🏍️", layout="wide")
     
