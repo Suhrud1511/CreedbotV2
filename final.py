@@ -1038,15 +1038,28 @@ class Dashboard:
         # Get upcoming rides using RideManager
         upcoming_rides = self.ride_manager.get_upcoming_rides()
         
+        if not upcoming_rides:
+            st.info("No upcoming rides available to join.")
+            return
+            
         for ride in upcoming_rides:
             # Format dates for display
             start_date = ride['start_date'].strftime('%Y-%m-%d')
             end_date = ride['end_date'].strftime('%Y-%m-%d')
             date_display = start_date if start_date == end_date else f"{start_date} to {end_date}"
             
+            # Check if user is a participant
+            str_user_id = str(user['_id'])
+            is_registered = str_user_id in [str(p) for p in ride.get('participants', [])]
+            
+            # Add status badge to the ride card
+            status_badge = ""
+            if is_registered:
+                status_badge = """<span style="background-color: #10b981; color: white; padding: 3px 8px; border-radius: 4px; font-size: 0.8rem; font-weight: 600; float: right;">Joined ✓</span>"""
+            
             st.markdown(f"""
             <div class="ride-card">
-                <h3>#{ride['ride_id']} - {ride['name']}</h3>
+                <h3>#{ride['ride_id']} - {ride['name']} {status_badge}</h3>
                 <p>📍 {ride['meeting_point']}</p>
                 <p>📅 {date_display} | ⏰ {ride['meeting_time']}</p>
                 <p>{ride.get('description', '')}</p>
@@ -1055,14 +1068,15 @@ class Dashboard:
             
             col1, col2 = st.columns([1, 4])
             with col1:
-                str_user_id = str(user['_id'])
-                if str_user_id in [str(p) for p in ride.get('participants', [])]:
-                    if st.button("Leave", key=f"leave_{ride['ride_id']}"):
+                if is_registered:
+                    if st.button("Leave", key=f"leave_{ride['ride_id']}", type="primary"):
                         if self.ride_manager.remove_participant(ride['ride_id'], str_user_id):
+                            st.success("You have left this ride.")
                             st.rerun()
                 else:
-                    if st.button("Join", key=f"join_{ride['ride_id']}"):
+                    if st.button("Join", key=f"join_{ride['ride_id']}", type="primary"):
                         if self.ride_manager.add_participant(ride['ride_id'], str_user_id):
+                            st.success("You have joined this ride!")
                             st.rerun()
 
     def _show_attendance_marking(self):
@@ -1808,6 +1822,7 @@ def main():
                                 success_message = "Registration successful! Please login."
                                 if user_manager._is_first_user():
                                     success_message += " You have been granted admin privileges as the first user."
+                                
                                 st.success(success_message)
                                 
                                 st.rerun()
