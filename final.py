@@ -1650,7 +1650,7 @@ def reset_password(email_or_phone, new_password, user_manager):
         return False, f"An error occurred: {str(e)}"
         
 def main():
-    st.set_page_config(page_title="Bikers Club", page_icon="🏍️", layout="wide")
+    st.set_page_config(page_title="Bikers Creed", page_icon="🏍️", layout="wide")
     
     try:
         # Initialize managers with the configured URI
@@ -1694,7 +1694,7 @@ def main():
             st.markdown("""
             <div style="background: linear-gradient(135deg, rgba(124, 58, 237, 0.1), rgba(124, 58, 237, 0.3)); 
                         padding: 30px; border-radius: 15px; margin-bottom: 20px; height: 100%;">
-                <h2 style="color: #7c3aed; margin-bottom: 20px;">Why Join Bikers Club?</h2>
+                <h2 style="color: #7c3aed; margin-bottom: 20px;">Why Join Bikers Creed?</h2>
                 <ul style="list-style-type: none; padding-left: 0;">
                     <li style="margin-bottom: 15px; display: flex; align-items: center;">
                         <span style="color: #7c3aed; font-size: 1.5rem; margin-right: 10px;">🛣️</span> 
